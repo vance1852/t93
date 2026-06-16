@@ -14,13 +14,16 @@ public class StatsService {
     private final StockTransactionRepository transactionRepo;
     private final SparePartRepository sparePartRepo;
     private final SparePartStockRepository stockRepo;
+    private final WarehouseRepository warehouseRepo;
 
     public StatsService(StockTransactionRepository transactionRepo,
                         SparePartRepository sparePartRepo,
-                        SparePartStockRepository stockRepo) {
+                        SparePartStockRepository stockRepo,
+                        WarehouseRepository warehouseRepo) {
         this.transactionRepo = transactionRepo;
         this.sparePartRepo = sparePartRepo;
         this.stockRepo = stockRepo;
+        this.warehouseRepo = warehouseRepo;
     }
 
     public static class ConsumptionStats {
@@ -119,6 +122,8 @@ public class StatsService {
     public List<LowStockWarning> getLowStockWarnings() {
         List<LowStockWarning> warnings = new ArrayList<>();
         List<SparePart> allParts = sparePartRepo.findAll();
+        Map<Long, String> warehouseNameMap = new HashMap<>();
+        warehouseRepo.findAll().forEach(w -> warehouseNameMap.put(w.getId(), w.getName()));
 
         for (SparePart part : allParts) {
             if (part.getSafetyStock() == null || part.getSafetyStock() <= 0) {
@@ -127,9 +132,10 @@ public class StatsService {
             List<SparePartStock> stocks = stockRepo.findBySparePartId(part.getId());
             for (SparePartStock stock : stocks) {
                 if (stock.getQuantity() < part.getSafetyStock()) {
+                    String whName = warehouseNameMap.getOrDefault(stock.getWarehouseId(), "");
                     warnings.add(new LowStockWarning(
                             part.getId(), part.getCode(), part.getName(),
-                            stock.getWarehouseId(), "",
+                            stock.getWarehouseId(), whName,
                             stock.getQuantity(), part.getSafetyStock(),
                             part.getSafetyStock() - stock.getQuantity()));
                 }
@@ -144,18 +150,20 @@ public class StatsService {
         public String sparePartCode;
         public String sparePartName;
         public Long warehouseId;
+        public String warehouseName;
         public int quantity;
         public BigDecimal stockValue;
         public LocalDateTime lastMovementAt;
         public long daysIdle;
 
         public DeadStockItem(Long sparePartId, String sparePartCode, String sparePartName,
-                             Long warehouseId, int quantity, BigDecimal stockValue,
+                             Long warehouseId, String warehouseName, int quantity, BigDecimal stockValue,
                              LocalDateTime lastMovementAt, long daysIdle) {
             this.sparePartId = sparePartId;
             this.sparePartCode = sparePartCode;
             this.sparePartName = sparePartName;
             this.warehouseId = warehouseId;
+            this.warehouseName = warehouseName;
             this.quantity = quantity;
             this.stockValue = stockValue;
             this.lastMovementAt = lastMovementAt;
@@ -167,6 +175,8 @@ public class StatsService {
         List<DeadStockItem> deadStocks = new ArrayList<>();
         LocalDateTime thresholdDate = LocalDateTime.now().minusDays(idleDaysThreshold);
         List<SparePartStock> allStocks = stockRepo.findAll();
+        Map<Long, String> warehouseNameMap = new HashMap<>();
+        warehouseRepo.findAll().forEach(w -> warehouseNameMap.put(w.getId(), w.getName()));
 
         for (SparePartStock stock : allStocks) {
             if (stock.getQuantity() <= 0) {
@@ -181,9 +191,10 @@ public class StatsService {
                 if (part != null) {
                     long daysIdle = java.time.Duration.between(lastMove, LocalDateTime.now()).toDays();
                     BigDecimal stockValue = part.getUnitPrice().multiply(BigDecimal.valueOf(stock.getQuantity()));
+                    String whName = warehouseNameMap.getOrDefault(stock.getWarehouseId(), "");
                     deadStocks.add(new DeadStockItem(
                             part.getId(), part.getCode(), part.getName(),
-                            stock.getWarehouseId(), stock.getQuantity(),
+                            stock.getWarehouseId(), whName, stock.getQuantity(),
                             stockValue, lastMove, daysIdle));
                 }
             }
@@ -211,10 +222,10 @@ public class StatsService {
 
     public CostAnalysis getCostAnalysis(LocalDateTime startDate, LocalDateTime endDate) {
         List<StockTransaction> issueTxns = transactionRepo.findIssueTransactionsByDateRange(startDate, endDate);
+        List<StockTransaction> inTxns = transactionRepo.findInboundTransactionsByDateRange(startDate, endDate);
 
         BigDecimal totalIssueAmount = BigDecimal.ZERO;
         int totalIssueQty = 0;
-
         for (StockTransaction tx : issueTxns) {
             if (tx.getTotalPrice() != null) {
                 totalIssueAmount = totalIssueAmount.add(tx.getTotalPrice());
@@ -222,10 +233,19 @@ public class StatsService {
             totalIssueQty += tx.getQuantity();
         }
 
+        BigDecimal totalInAmount = BigDecimal.ZERO;
+        int totalInQty = 0;
+        for (StockTransaction tx : inTxns) {
+            if (tx.getTotalPrice() != null) {
+                totalInAmount = totalInAmount.add(tx.getTotalPrice());
+            }
+            totalInQty += tx.getQuantity();
+        }
+
         BigDecimal avgPrice = totalIssueQty > 0
                 ? totalIssueAmount.divide(BigDecimal.valueOf(totalIssueQty), 2, BigDecimal.ROUND_HALF_UP)
                 : BigDecimal.ZERO;
 
-        return new CostAnalysis(totalIssueAmount, BigDecimal.ZERO, totalIssueQty, 0, avgPrice);
+        return new CostAnalysis(totalIssueAmount, totalInAmount, totalIssueQty, totalInQty, avgPrice);
     }
 }

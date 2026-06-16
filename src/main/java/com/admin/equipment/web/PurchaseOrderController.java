@@ -139,6 +139,22 @@ public class PurchaseOrderController {
         return purchaseService.generatePurchaseSuggestions(warehouseId);
     }
 
+    @GetMapping("/suggestions/forecast")
+    public List<PurchaseService.ForecastSuggestion> getForecastSuggestions(
+            @RequestParam(defaultValue = "30") int forecastDays,
+            @RequestParam(defaultValue = "90") int historyDays,
+            @RequestParam(required = false) Long warehouseId,
+            @RequestParam(required = false) String equipmentType,
+            @RequestParam(required = false) Long equipmentId) {
+        PurchaseService.ForecastRequest req = new PurchaseService.ForecastRequest();
+        req.forecastDays = forecastDays;
+        req.historyDays = historyDays;
+        req.warehouseId = warehouseId;
+        req.equipmentType = equipmentType;
+        req.equipmentId = equipmentId;
+        return purchaseService.generateForecastSuggestions(req);
+    }
+
     @GetMapping("/warnings/low-stock")
     public List<StatsService.LowStockWarning> getLowStockWarnings() {
         return statsService.getLowStockWarnings();

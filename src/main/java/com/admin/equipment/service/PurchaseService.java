@@ -9,7 +9,9 @@ import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
 @Service
@@ -20,18 +22,27 @@ public class PurchaseService {
     private final SparePartRepository sparePartRepo;
     private final SparePartStockRepository stockRepo;
     private final StockService stockService;
+    private final WorkOrderRepository workOrderRepo;
+    private final StockTransactionRepository transactionRepo;
+    private final EquipmentRepository equipmentRepo;
     private final AtomicInteger poCounter = new AtomicInteger(0);
 
     public PurchaseService(PurchaseOrderRepository purchaseOrderRepo,
                            PurchaseOrderItemRepository purchaseOrderItemRepo,
                            SparePartRepository sparePartRepo,
                            SparePartStockRepository stockRepo,
-                           StockService stockService) {
+                           StockService stockService,
+                           WorkOrderRepository workOrderRepo,
+                           StockTransactionRepository transactionRepo,
+                           EquipmentRepository equipmentRepo) {
         this.purchaseOrderRepo = purchaseOrderRepo;
         this.purchaseOrderItemRepo = purchaseOrderItemRepo;
         this.sparePartRepo = sparePartRepo;
         this.stockRepo = stockRepo;
         this.stockService = stockService;
+        this.workOrderRepo = workOrderRepo;
+        this.transactionRepo = transactionRepo;
+        this.equipmentRepo = equipmentRepo;
     }
 
     private String generatePoCode() {
@@ -92,14 +103,122 @@ public class PurchaseService {
     }
 
     public static class ForecastRequest {
-        public LocalDateTime startDate;
-        public LocalDateTime endDate;
-        public Long equipmentId;
+        public int forecastDays;
+        public int historyDays;
+        public Long warehouseId;
         public String equipmentType;
+        public Long equipmentId;
+
+        public ForecastRequest() {
+            this.forecastDays = 30;
+            this.historyDays = 90;
+        }
     }
 
-    public List<PurchaseSuggestion> generateForecastSuggestions(ForecastRequest request) {
-        List<PurchaseSuggestion> suggestions = new ArrayList<>();
+    public static class ForecastSuggestion extends PurchaseSuggestion {
+        public int forecastDemand;
+        public int historyConsumption;
+        public double dailyRate;
+        public int safetyStock;
+
+        public ForecastSuggestion(Long sparePartId, String sparePartCode, String sparePartName,
+                                  int currentStock, int safetyStock, int suggestedQuantity,
+                                  Long defaultWarehouseId, int forecastDemand,
+                                  int historyConsumption, double dailyRate) {
+            super(sparePartId, sparePartCode, sparePartName, currentStock,
+                    safetyStock, suggestedQuantity, defaultWarehouseId);
+            this.forecastDemand = forecastDemand;
+            this.historyConsumption = historyConsumption;
+            this.dailyRate = dailyRate;
+            this.safetyStock = safetyStock;
+        }
+    }
+
+    public List<ForecastSuggestion> generateForecastSuggestions(ForecastRequest request) {
+        int forecastDays = request.forecastDays > 0 ? request.forecastDays : 30;
+        int historyDays = request.historyDays > 0 ? request.historyDays : 90;
+
+        LocalDateTime historyStart = LocalDateTime.now().minusDays(historyDays);
+        LocalDateTime historyEnd = LocalDateTime.now();
+
+        Map<Long, Integer> historyConsumption = new HashMap<>();
+        Map<Long, Long> sparePartToWarehouse = new HashMap<>();
+
+        List<WorkOrder> maintOrders = workOrderRepo.findAll().stream()
+                .filter(w -> "maintenance".equals(w.getType()))
+                .filter(w -> w.getCreatedAt().isAfter(historyStart) && w.getCreatedAt().isBefore(historyEnd))
+                .filter(w -> {
+                    if (request.equipmentId != null) {
+                        return w.getEquipmentId().equals(request.equipmentId);
+                    }
+                    if (request.equipmentType != null) {
+                        Equipment eq = equipmentRepo.findById(w.getEquipmentId()).orElse(null);
+                        return eq != null && request.equipmentType.equals(eq.getType());
+                    }
+                    return true;
+                })
+                .toList();
+
+        for (WorkOrder wo : maintOrders) {
+            List<StockTransaction> txns = transactionRepo.findByWorkOrderIdOrderByCreatedAtDesc(wo.getId());
+            for (StockTransaction tx : txns) {
+                if ("issue".equals(tx.getType())) {
+                    historyConsumption.merge(tx.getSparePartId(), tx.getQuantity(), Integer::sum);
+                    if (request.warehouseId == null || request.warehouseId.equals(tx.getWarehouseId())) {
+                        sparePartToWarehouse.put(tx.getSparePartId(), tx.getWarehouseId());
+                    }
+                }
+            }
+        }
+
+        if (request.equipmentType != null) {
+            int equipCount = (int) equipmentRepo.findAll().stream()
+                    .filter(e -> request.equipmentType.equals(e.getType()))
+                    .count();
+            if (maintOrders.size() > 0 && equipCount > 0) {
+                double ordersPerEquip = (double) maintOrders.size() / equipCount;
+                double scaleFactor = equipCount * ordersPerEquip / maintOrders.size();
+                if (scaleFactor > 1) {
+                    Map<Long, Integer> scaled = new HashMap<>();
+                    for (Map.Entry<Long, Integer> e : historyConsumption.entrySet()) {
+                        scaled.put(e.getKey(), (int) Math.ceil(e.getValue() * scaleFactor));
+                    }
+                    historyConsumption = scaled;
+                }
+            }
+        }
+
+        List<ForecastSuggestion> suggestions = new ArrayList<>();
+        for (Map.Entry<Long, Integer> entry : historyConsumption.entrySet()) {
+            Long sparePartId = entry.getKey();
+            int histQty = entry.getValue();
+            double dailyRate = (double) histQty / historyDays;
+            int forecastDemand = (int) Math.ceil(dailyRate * forecastDays);
+
+            SparePart part = sparePartRepo.findById(sparePartId).orElse(null);
+            if (part == null) continue;
+
+            Long whId = request.warehouseId != null ? request.warehouseId
+                    : sparePartToWarehouse.getOrDefault(sparePartId, 1L);
+
+            SparePartStock stock = stockRepo.findBySparePartIdAndWarehouseId(sparePartId, whId).orElse(null);
+            int currentStock = stock != null ? stock.getQuantity() : 0;
+            int safetyStock = part.getSafetyStock() != null ? part.getSafetyStock() : 0;
+
+            int targetStock = Math.max(safetyStock, forecastDemand);
+            int suggestedQty = targetStock - currentStock;
+            if (suggestedQty <= 0) {
+                continue;
+            }
+
+            suggestions.add(new ForecastSuggestion(
+                    sparePartId, part.getCode(), part.getName(),
+                    currentStock, safetyStock, suggestedQty, whId,
+                    forecastDemand, histQty, Math.round(dailyRate * 100.0) / 100.0
+            ));
+        }
+
+        suggestions.sort((a, b) -> Integer.compare(b.suggestedQuantity, a.suggestedQuantity));
         return suggestions;
     }
 
@@ -121,11 +240,13 @@ public class PurchaseService {
             if (item.getUnitPrice() == null) {
                 item.setUnitPrice(BigDecimal.ZERO);
             }
-            if (item.getTotalPrice() == null) {
-                item.setTotalPrice(item.getUnitPrice().multiply(BigDecimal.valueOf(item.getQuantity())));
+            if (item.getQuantity() == null || item.getQuantity() <= 0) {
+                throw new IllegalArgumentException("采购数量必须大于0");
             }
+            BigDecimal lineTotal = item.getUnitPrice().multiply(BigDecimal.valueOf(item.getQuantity()));
+            item.setTotalPrice(lineTotal);
             purchaseOrderItemRepo.save(item);
-            totalAmount = totalAmount.add(item.getTotalPrice());
+            totalAmount = totalAmount.add(lineTotal);
         }
 
         po.setTotalAmount(totalAmount);

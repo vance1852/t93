@@ -21,6 +21,11 @@ public interface StockTransactionRepository extends JpaRepository<StockTransacti
             @Param("startDate") LocalDateTime startDate,
             @Param("endDate") LocalDateTime endDate);
 
+    @Query("SELECT t FROM StockTransaction t WHERE t.type = 'in' AND t.createdAt >= :startDate AND t.createdAt < :endDate ORDER BY t.createdAt DESC")
+    List<StockTransaction> findInboundTransactionsByDateRange(
+            @Param("startDate") LocalDateTime startDate,
+            @Param("endDate") LocalDateTime endDate);
+
     @Query("SELECT t.sparePartId, SUM(t.quantity) as totalQty, SUM(t.totalPrice) as totalAmount " +
            "FROM StockTransaction t WHERE t.type = 'issue' AND t.createdAt >= :startDate AND t.createdAt < :endDate " +
            "GROUP BY t.sparePartId")
